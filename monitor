@@ -1,0 +1,264 @@
+#!/bin/bash
+PREV_FILE="/tmp/vllm_monitor_prev"
+LAST_REQUEST_FILE="/tmp/vllm_monitor_last_request"
+TPS_SAMPLES_FILE="/tmp/vllm_monitor_tps_samples"
+CURRENT_REQUEST_FILE="/tmp/vllm_monitor_current_request"
+touch "$PREV_FILE" "$LAST_REQUEST_FILE" "$TPS_SAMPLES_FILE" "$CURRENT_REQUEST_FILE"
+to_int() {
+    if [ -z "$1" ]; then
+        echo "0"
+    else
+        printf "%.0f\n" "$1" 2>/dev/null || echo "0"
+    fi
+}
+calc_filtered_avg() {
+    local values="$1"
+    local exclude_lowest="$2"
+    local non_zero_values=$(echo "$values" | tr ' ' '\n' | grep -v '^0$\|^0\.0$\|^$' | sort -n)
+    local count=$(echo "$non_zero_values" | grep -v '^$' | wc -l)
+    if [ "$count" -eq 0 ]; then
+        echo "0"
+        return
+    fi
+    if [ "$count" -ge 3 ] && [ "$exclude_lowest" -gt 0 ]; then
+        non_zero_values=$(echo "$non_zero_values" | tail -n +$((exclude_lowest + 1)))
+        count=$((count - exclude_lowest))
+    fi
+    local sum=$(echo "$non_zero_values" | paste -sd+ | bc 2>/dev/null || echo "0")
+    if [ "$count" -gt 0 ]; then
+        echo "scale=1; $sum / $count" | bc 2>/dev/null || echo "0"
+    else
+        echo "0"
+    fi
+}
+while true; do
+    clear
+    echo "=== vLLM Cache Monitor - $(date) ==="
+    echo ""
+    METRICS=$(curl -s localhost:8079/metrics | grep -v "^#")
+    CURR_TIME=$(date +%s)
+    CURR_PROMPT_TOKENS_RAW=$(echo "$METRICS" | grep "prompt_tokens_total" | awk '{print $2}')
+    CURR_GEN_TOKENS_RAW=$(echo "$METRICS" | grep "generation_tokens_total" | awk '{print $2}')
+    CURR_PREFIX_HITS_RAW=$(echo "$METRICS" | grep "prefix_cache_hits_total" | awk '{print $2}')
+    CURR_PROMPT_TOKENS=$(to_int "$CURR_PROMPT_TOKENS_RAW")
+    CURR_GEN_TOKENS=$(to_int "$CURR_GEN_TOKENS_RAW")
+    CURR_PREFIX_HITS=$(to_int "$CURR_PREFIX_HITS_RAW")
+    CURR_NEW_PROMPT_TOKENS=$((CURR_PROMPT_TOKENS - CURR_PREFIX_HITS))
+    if [ -f "$PREV_FILE" ]; then
+        source "$PREV_FILE"
+        PREV_PROMPT_TOKENS=$(to_int "${PREV_PROMPT_TOKENS:-0}")
+        PREV_GEN_TOKENS=$(to_int "${PREV_GEN_TOKENS:-0}")
+        PREV_PREFIX_HITS=$(to_int "${PREV_PREFIX_HITS:-0}")
+        PREV_NEW_PROMPT_TOKENS=$(to_int "${PREV_NEW_PROMPT_TOKENS:-0}")
+    else
+        PREV_PROMPT_TOKENS=0
+        PREV_GEN_TOKENS=0
+        PREV_PREFIX_HITS=0
+        PREV_NEW_PROMPT_TOKENS=0
+        PREV_TIME=0
+        IN_REQUEST=0
+        REQUEST_START_PROMPT_TOKENS=0
+        REQUEST_START_GEN_TOKENS=0
+    fi
+    if [ -f "$LAST_REQUEST_FILE" ]; then
+        source "$LAST_REQUEST_FILE"
+    fi
+    if [ -f "$CURRENT_REQUEST_FILE" ]; then
+        source "$CURRENT_REQUEST_FILE"
+    fi
+    if [ -f "$TPS_SAMPLES_FILE" ]; then
+        source "$TPS_SAMPLES_FILE"
+    else
+        PROMPT_TPS_SAMPLES=""
+        GEN_TPS_SAMPLES=""
+    fi
+    echo "GPU KV CACHE USAGE:"
+    echo "$METRICS" | grep "kv_cache_usage_perc" | grep -v created | awk '{printf "  %.1f%% of GPU blocks in use\n", $2*100}'
+    echo ""
+    echo "REQUESTS:"
+    RUNNING=$(echo "$METRICS" | grep "num_requests_running" | awk '{print $2}')
+    WAITING=$(echo "$METRICS" | grep "num_requests_waiting" | awk '{print $2}')
+    echo "  Running: $RUNNING"
+    echo "  Waiting: $WAITING"
+    echo ""
+    echo "THROUGHPUT (newly processed tokens only):"
+    CURRENT_PROMPT_TPS="0"
+    CURRENT_GEN_TPS="0"
+    if [ -n "$PREV_TIME" ] && [ "$PREV_TIME" != "0" ]; then
+        TIME_DELTA=$((CURR_TIME - PREV_TIME))
+        if [ $TIME_DELTA -gt 0 ]; then
+            TOTAL_PROMPT_DELTA=$((CURR_PROMPT_TOKENS - PREV_PROMPT_TOKENS))
+            PREFIX_HIT_DELTA=$((CURR_PREFIX_HITS - PREV_PREFIX_HITS))
+            NEW_PROMPT_DELTA=$((CURR_NEW_PROMPT_TOKENS - PREV_NEW_PROMPT_TOKENS))
+            if [ $NEW_PROMPT_DELTA -lt 0 ]; then
+                NEW_PROMPT_DELTA=0
+            fi
+            if [ $NEW_PROMPT_DELTA -gt 0 ]; then
+                CURRENT_PROMPT_TPS=$(echo "scale=1; $NEW_PROMPT_DELTA / $TIME_DELTA" | bc 2>/dev/null || echo "0")
+            else
+                CURRENT_PROMPT_TPS="0"
+            fi
+            GEN_DELTA=$((CURR_GEN_TOKENS - PREV_GEN_TOKENS))
+            if [ $GEN_DELTA -lt 0 ]; then
+                GEN_DELTA=0
+            fi
+            CURRENT_GEN_TPS=$(echo "scale=1; $GEN_DELTA / $TIME_DELTA" | bc 2>/dev/null || echo "0")
+            if [ "$TOTAL_PROMPT_DELTA" -gt 0 ]; then
+                if [ "$IN_REQUEST" != "1" ]; then
+                    PROMPT_TPS_SAMPLES=""
+                    GEN_TPS_SAMPLES=""
+                    IN_REQUEST=1
+                    REQUEST_START_PROMPT_TOKENS=$PREV_PROMPT_TOKENS
+                    REQUEST_START_GEN_TOKENS=$PREV_GEN_TOKENS
+                    REQUEST_START_PREFIX_HITS=$PREV_PREFIX_HITS
+                fi
+                if [ $PREFIX_HIT_DELTA -gt 0 ] || [ $NEW_PROMPT_DELTA -gt 0 ]; then
+                    if [ $TOTAL_PROMPT_DELTA -gt 0 ]; then
+                        CURRENT_CACHE_HIT_RATE=$(echo "scale=1; $PREFIX_HIT_DELTA * 100 / $TOTAL_PROMPT_DELTA" | bc 2>/dev/null || echo "0")
+                    else
+                        CURRENT_CACHE_HIT_RATE="0"
+                    fi
+                    CURRENT_CACHE_HITS=$PREFIX_HIT_DELTA
+                    CURRENT_NEW_KV=$NEW_PROMPT_DELTA
+                    CURRENT_TOTAL_PROMPT=$TOTAL_PROMPT_DELTA
+                    cat > "$CURRENT_REQUEST_FILE" << EOF
+CURRENT_CACHE_HIT_RATE=$CURRENT_CACHE_HIT_RATE
+CURRENT_CACHE_HITS=$CURRENT_CACHE_HITS
+CURRENT_NEW_KV=$CURRENT_NEW_KV
+CURRENT_TOTAL_PROMPT=$CURRENT_TOTAL_PROMPT
+REQUEST_START_PROMPT_TOKENS=$REQUEST_START_PROMPT_TOKENS
+REQUEST_START_GEN_TOKENS=$REQUEST_START_GEN_TOKENS
+REQUEST_START_PREFIX_HITS=$REQUEST_START_PREFIX_HITS
+EOF
+                fi
+            fi
+            if [ "$IN_REQUEST" = "1" ] || [ "$RUNNING" != "0.0" ]; then
+                if [ $NEW_PROMPT_DELTA -gt 0 ]; then
+                    echo "  Current Prompt TPS: ${CURRENT_PROMPT_TPS} tokens/sec (processing new)"
+                else
+                    echo "  Current Prompt TPS: 0 tokens/sec"
+                fi
+                if [ ! -z "$CURRENT_CACHE_HIT_RATE" ]; then
+                    echo "    ├─ Total prompt tokens: $CURRENT_TOTAL_PROMPT"
+                    echo "    ├─ Cache hits: $CURRENT_CACHE_HITS tokens (${CURRENT_CACHE_HIT_RATE}% hit)"
+                    echo "    └─ New KV compute: $CURRENT_NEW_KV tokens"
+                fi
+            else
+                echo "  Current Prompt TPS: 0 tokens/sec"
+            fi
+            if [ "$GEN_DELTA" -gt 0 ]; then
+                echo "  Current Generation TPS: ${CURRENT_GEN_TPS} tokens/sec"
+            else
+                echo "  Current Generation TPS: 0 tokens/sec"
+            fi
+            if [ "$IN_REQUEST" = "1" ] && [ "$RUNNING" = "0.0" ] && [ "$GEN_DELTA" -eq 0 ]; then
+                LAST_PROMPT_TPS=$(calc_filtered_avg "$PROMPT_TPS_SAMPLES" 2)
+                LAST_GEN_TPS=$(calc_filtered_avg "$GEN_TPS_SAMPLES" 2)
+                LAST_REQUEST_PROMPT_COUNT=$((CURR_PROMPT_TOKENS - REQUEST_START_PROMPT_TOKENS))
+                LAST_REQUEST_GEN_COUNT=$((CURR_GEN_TOKENS - REQUEST_START_GEN_TOKENS))
+                LAST_REQUEST_CACHE_HITS=$((CURR_PREFIX_HITS - REQUEST_START_PREFIX_HITS))
+                LAST_REQUEST_NEW_KV=$((LAST_REQUEST_PROMPT_COUNT - LAST_REQUEST_CACHE_HITS))
+                cat > "$LAST_REQUEST_FILE" << EOF
+LAST_PROMPT_TPS=$LAST_PROMPT_TPS
+LAST_GEN_TPS=$LAST_GEN_TPS
+LAST_REQUEST_PROMPT_COUNT=$LAST_REQUEST_PROMPT_COUNT
+LAST_REQUEST_GEN_COUNT=$LAST_REQUEST_GEN_COUNT
+LAST_REQUEST_CACHE_HITS=$LAST_REQUEST_CACHE_HITS
+LAST_REQUEST_NEW_KV=$LAST_REQUEST_NEW_KV
+EOF
+                PROMPT_TPS_SAMPLES=""
+                GEN_TPS_SAMPLES=""
+                IN_REQUEST=0
+                rm -f "$CURRENT_REQUEST_FILE"
+            fi
+            if [ "$IN_REQUEST" = "1" ]; then
+                if [ "$NEW_PROMPT_DELTA" -gt 0 ]; then
+                    PROMPT_TPS_SAMPLES="$PROMPT_TPS_SAMPLES $CURRENT_PROMPT_TPS"
+                fi
+                if [ "$GEN_DELTA" -gt 0 ]; then
+                    GEN_TPS_SAMPLES="$GEN_TPS_SAMPLES $CURRENT_GEN_TPS"
+                fi
+            fi
+        else
+            echo "  Current Prompt TPS: 0 tokens/sec"
+            echo "  Current Generation TPS: 0 tokens/sec"
+        fi
+    else
+        echo "  Current Prompt TPS: calculating..."
+        echo "  Current Generation TPS: calculating..."
+    fi
+    echo ""
+    if [ ! -z "$LAST_PROMPT_TPS" ]; then
+        echo "  Last Request Prompt TPS: ${LAST_PROMPT_TPS} tokens/sec (new KV only)"
+        echo "    └─ Prompt: ${LAST_REQUEST_PROMPT_COUNT} total, ${LAST_REQUEST_NEW_KV} new KV, ${LAST_REQUEST_CACHE_HITS} cached"
+    else
+        echo "  Last Request Prompt TPS: awaiting first request"
+    fi
+    if [ ! -z "$LAST_GEN_TPS" ]; then
+        echo "  Last Request Generation TPS: ${LAST_GEN_TPS} tokens/sec"
+        echo "    └─ Generated: ${LAST_REQUEST_GEN_COUNT} tokens"
+    else
+        echo "  Last Request Generation TPS: awaiting first request"
+    fi
+    echo ""
+    echo "LATENCIES:"
+    TTFT_SUM=$(echo "$METRICS" | grep "time_to_first_token_seconds_sum" | awk '{print $2}')
+    TTFT_COUNT=$(echo "$METRICS" | grep "time_to_first_token_seconds_count" | awk '{print $2}')
+    if [ ! -z "$TTFT_COUNT" ] && [ ! -z "$TTFT_SUM" ]; then
+        TTFT_COUNT_INT=$(to_int "$TTFT_COUNT")
+        if [ "$TTFT_COUNT_INT" -gt 0 ]; then
+            TTFT_AVG=$(echo "scale=3; $TTFT_SUM / $TTFT_COUNT" | bc 2>/dev/null || echo "0")
+            echo "  Avg Time to First Token: ${TTFT_AVG}s"
+        fi
+    fi
+    E2E_SUM=$(echo "$METRICS" | grep "e2e_request_latency_seconds_sum" | awk '{print $2}')
+    E2E_COUNT=$(echo "$METRICS" | grep "e2e_request_latency_seconds_count" | awk '{print $2}')
+    if [ ! -z "$E2E_COUNT" ] && [ ! -z "$E2E_SUM" ]; then
+        E2E_COUNT_INT=$(to_int "$E2E_COUNT")
+        if [ "$E2E_COUNT_INT" -gt 0 ]; then
+            E2E_AVG=$(echo "scale=3; $E2E_SUM / $E2E_COUNT" | bc 2>/dev/null || echo "0")
+            echo "  Avg E2E Latency: ${E2E_AVG}s"
+        fi
+    fi
+    INTER_SUM=$(echo "$METRICS" | grep "inter_token_latency_seconds_sum" | awk '{print $2}')
+    INTER_COUNT=$(echo "$METRICS" | grep "inter_token_latency_seconds_count" | awk '{print $2}')
+    if [ ! -z "$INTER_COUNT" ] && [ ! -z "$INTER_SUM" ]; then
+        INTER_COUNT_INT=$(to_int "$INTER_COUNT")
+        if [ "$INTER_COUNT_INT" -gt 0 ]; then
+            INTER_AVG=$(echo "scale=3; $INTER_SUM / $INTER_COUNT * 1000" | bc 2>/dev/null || echo "0")
+            echo "  Avg Inter-token: ${INTER_AVG}ms"
+        fi
+    fi
+    echo ""
+    echo "PREFIX CACHE:"
+    HITS=$(echo "$METRICS" | grep "prefix_cache_hits_total" | awk '{print $2}')
+    QUERIES=$(echo "$METRICS" | grep "prefix_cache_queries_total" | awk '{print $2}')
+    if [ ! -z "$QUERIES" ] && [ ! -z "$HITS" ]; then
+        HITS_NUM=$(to_int "$HITS")
+        QUERIES_NUM=$(to_int "$QUERIES")
+        if [ "$QUERIES_NUM" -gt 0 ]; then
+            RATE=$(echo "scale=1; $HITS_NUM * 100 / $QUERIES_NUM" | bc 2>/dev/null || echo "0")
+            echo "  Hit Rate: ${RATE}% (cumulative)"
+        fi
+    fi
+    echo ""
+    echo "MEMORY PRESSURE:"
+    PREEMPT=$(echo "$METRICS" | grep "num_preemptions_total" | awk '{print $2}')
+    echo "  Preemptions: ${PREEMPT:-0}"
+    cat > "$PREV_FILE" << EOF
+PREV_TIME=$CURR_TIME
+PREV_PROMPT_TOKENS=$CURR_PROMPT_TOKENS
+PREV_GEN_TOKENS=$CURR_GEN_TOKENS
+PREV_PREFIX_HITS=$CURR_PREFIX_HITS
+PREV_NEW_PROMPT_TOKENS=$CURR_NEW_PROMPT_TOKENS
+IN_REQUEST=$IN_REQUEST
+REQUEST_START_PROMPT_TOKENS=$REQUEST_START_PROMPT_TOKENS
+REQUEST_START_GEN_TOKENS=$REQUEST_START_GEN_TOKENS
+REQUEST_START_PREFIX_HITS=$REQUEST_START_PREFIX_HITS
+EOF
+    cat > "$TPS_SAMPLES_FILE" << EOF
+PROMPT_TPS_SAMPLES="$PROMPT_TPS_SAMPLES"
+GEN_TPS_SAMPLES="$GEN_TPS_SAMPLES"
+EOF
+    sleep 2
+done
